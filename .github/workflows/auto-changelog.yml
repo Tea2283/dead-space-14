@@ -10,9 +10,7 @@ on:
 
 jobs:
   auto-changelog:
-    if: >
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -124,8 +122,9 @@ jobs:
 
 
       - name: Commit and push changes
-        uses: stefanzweifel/git-auto-commit-action@v4
+        uses: endbug/add-and-commit@v9
         with:
-          commit_message: "Обновлён ченжлог #${{ github.event.pull_request.number }}"
-          file_pattern: Resources/Changelog/ChangelogDS14.yml
-          branch: ${{ github.event.pull_request.base.ref }}
+          author_name: github-actions
+          author_email: actions@github.com
+          message: "Обновлён ченжлог #${{ github.event.pull_request.number }}"
+          add: Resources/Changelog/ChangelogDS14.yml
