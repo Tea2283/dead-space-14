@@ -92,66 +92,115 @@ jobs:
       - name: Prepare branch name
         id: branch
         run: |
-          # ветка, в которую будем пушить
-          BRANCH="auto/changelog-${{ github.event.pull_request.number }}"
+          # постоянная ветка, куда будем писать (меняйте при желании)
+          BRANCH="auto/changelog"
           echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
 
-      - name: Prepare auto changelog branch
+      - name: Prepare auto changelog branch (sync with origin)
         id: prepare_branch
         run: |
-          set -e
-          BRANCH="auto/changelog-${{ github.event.pull_request.number }}"
+          set -euo pipefail
+          BRANCH="${{ steps.branch.outputs.branch_name }}"
           echo "Branch to use: $BRANCH"
 
-          # Подтягиваем все ветки с origin, чтобы гарантировать наличие origin/<branch>
           git fetch origin '+refs/heads/*:refs/remotes/origin/*'
 
-          # Если есть ветка на origin — создаём/обновляем локальную ветку из неё
-          if git rev-parse --verify --quiet refs/remotes/origin/$BRANCH >/dev/null; then
-            echo "Remote branch origin/$BRANCH exists — checking out and resetting to origin/$BRANCH"
-            # если локальной ветки нет — создадим с тем же именем; если есть — перезапишем её
-            if git show-ref --verify --quiet refs/heads/$BRANCH; then
+          if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
+            echo "Remote branch origin/$BRANCH exists — checking out and rebasing on it"
+            # если локальной ветки нет — создаём; если есть — переключаемся
+            if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
               git checkout $BRANCH
-              git reset --hard origin/$BRANCH
             else
               git checkout -b $BRANCH origin/$BRANCH
             fi
+            # синхронизация: rebase на remote, чтобы локально было актуально
+            git fetch origin $BRANCH
+            git rebase --autostash origin/$BRANCH || {
+              echo "Rebase failed, trying merge fallback"
+              git rebase --abort || true
+              git merge --no-edit origin/$BRANCH || true
+            }
           else
             echo "Remote branch origin/$BRANCH does not exist — creating new local branch $BRANCH from current HEAD"
             git checkout -b $BRANCH
           fi
 
-          echo "Prepared local branch:"
-          git branch --show-current
+          echo "Prepared local branch: $(git branch --show-current)"
           git status --porcelain
           echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
-          
-      - name: Commit and push changes to auto branch
-        uses: stefanzweifel/git-auto-commit-action@v4
-        with:
-          branch: ${{ steps.prepare_branch.outputs.branch_name }}
-          commit_message: "Обновлён ченжлог #${{ github.event.pull_request.number }}"
-          file_pattern: Resources/Changelog/ChangelogDS14.yml
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # или secrets.GITHUB_TOKEN в зависимости от прав
 
-      - name: Create PR to master if not exists
+      - name: Commit and push changes to auto branch (with retries)
+        id: push_changes
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.prepare_branch.outputs.branch_name }}"
+
+          # Установим автора/коммитера (при необходимости поменяйте)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Добавляем изменения (тот же паттерн, что у вас)
+          git add Resources/Changelog/ChangelogDS14.yml
+
+          # Если нет изменений — выходим
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Обновлён ченжлог #${{ github.event.pull_request.number }}"
+
+          # Попытки пуша (максимум 3 попытки)
+          MAX_TRIES=3
+          for i in $(seq 1 $MAX_TRIES); do
+            echo "Push attempt $i..."
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Push succeeded"
+              PUSHED=true
+              break
+            fi
+            echo "Push failed, fetching remote and rebasing, then retry..."
+            git fetch origin $BRANCH || true
+            # если remote branch существует — rebase на него, иначе просто push в следующий итерации создаст branch
+            if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
+              git rebase --autostash origin/$BRANCH || {
+                echo "Rebase failed, trying merge fallback"
+                git rebase --abort || true
+                git merge --no-edit origin/$BRANCH || true
+              }
+            fi
+            # короткая пауза перед повтором
+            sleep 1
+            PUSHED=false
+          done
+
+          if [ "${PUSHED:-false}" != "true" ]; then
+            echo "Failed to push after $MAX_TRIES attempts" >&2
+            exit 1
+          fi
+
+      - name: Create PR to master if not exists (or reuse existing)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          HEAD_BRANCH="${{ steps.branch.outputs.branch_name }}"
+          set -euo pipefail
           REPO="${{ github.repository }}"
+          BRANCH="${{ steps.prepare_branch.outputs.branch_name }}"
+          # ищем открытый PR с head = repo_owner:BRANCH и base = master
           EXISTING_PR=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/pulls?head=${{ github.repository_owner }}:${HEAD_BRANCH}&base=master" \
-            | jq 'map(select(.state=="open")) | length')
-          if [ "$EXISTING_PR" -eq 0 ]; then
+            "https://api.github.com/repos/$REPO/pulls?head=${{ github.repository_owner }}:${BRANCH}&base=master" \
+            | jq 'map(select(.state=="open")) | .[0] // empty')
+
+          if [ -z "$EXISTING_PR" ]; then
+            echo "No existing PR found for $BRANCH — creating"
             curl -s -X POST \
               -H "Authorization: token $GH_TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.github.com/repos/$REPO/pulls" \
-              -d "$(jq -n --arg head "$HEAD_BRANCH" --arg base "master" --arg title "Auto: обновление changelog" --arg body "Автоматически сгенерированный PR с changelog’ом." '{title:$title, head:$head, base:$base, body:$body}')" \
+              -d "$(jq -n --arg head "$BRANCH" --arg base "master" --arg title "Auto: обновление changelog" --arg body "Автоматически сгенерированный PR с changelog’ом." '{title:$title, head:$head, base:$base, body:$body}')" \
               > /tmp/create_pr.json
             echo "PR создан"
           else
-            echo "PR уже существует"
+            PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+            echo "Found existing PR #$PR_NUMBER — it will be updated with new commits on branch $BRANCH"
           fi
