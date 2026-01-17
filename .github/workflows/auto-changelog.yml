@@ -19,17 +19,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
-          token: ${{ secrets.PERSONAL_KLOOPRE_PUSH_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: Ensure origin uses PAT for pushes
         run: |
-          git remote set-url origin "https://x-access-token:${{ secrets.PERSONAL_KLOOPRE_PUSH_TOKEN }}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git remote -v | sed -E 's/(https:\/\/)[^@]+@/\\1****@/g'
 
       - name: Git state and PAT permissions
         env:
-          PAT: ${{ secrets.PERSONAL_KLOOPRE_PUSH_TOKEN }}
+          PAT: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           echo "Current branch: $(git branch --show-current || echo '(no branch)')"
@@ -133,7 +133,7 @@ jobs:
           commit_message: "Обновлён ченжлог #${{ github.event.pull_request.number }}"
           file_pattern: Resources/Changelog/ChangelogDS14.yml
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_KLOOPRE_PUSH_TOKEN }} # или secrets.GITHUB_TOKEN в зависимости от прав
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # или secrets.GITHUB_TOKEN в зависимости от прав
 
       - name: Create PR to master if not exists
         env:
