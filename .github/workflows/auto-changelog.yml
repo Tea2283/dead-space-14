@@ -89,212 +89,37 @@ jobs:
           print("Changelog обновлён")
           EOF
 
-      - name: Prepare branch name
-        id: branch
-        run: |
-          # постоянная ветка, куда будем писать (меняйте при желании)
-          BRANCH="auto/changelog"
-          echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
-
-      - name: Prepare auto changelog branch (sync with origin)
-        id: prepare_branch
+      - name: Commit changelog directly to base branch (single push)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          BRANCH="${{ steps.branch.outputs.branch_name }}"
-          echo "Branch to use: $BRANCH"
+          BRANCH="${{ github.event.pull_request.base.ref }}"
+          FILE="Resources/Changelog/ChangelogDS14.yml"
 
-          # fetch all heads so we can inspect origin/$BRANCH
-          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
-
-          # If local branch already exists -> checkout it.
-          if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-            echo "Local branch $BRANCH exists — checking out"
-            git checkout $BRANCH
-          else
-            # If remote branch exists, create local branch that points to HEAD (so uncommitted changes are preserved),
-            # then rebase/merge origin/$BRANCH into it to bring remote changes on top.
-            if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
-              echo "Remote branch origin/$BRANCH exists — creating local branch from current HEAD to preserve uncommitted changes"
-              git branch -f "$BRANCH" HEAD
-              git checkout "$BRANCH"
-              git fetch origin "$BRANCH"
-              git rebase --autostash "origin/$BRANCH" || {
-                echo "Rebase failed, trying merge fallback"
-                git rebase --abort || true
-                git merge --no-edit "origin/$BRANCH" || true
-              }
-            else
-              echo "Remote branch origin/$BRANCH does not exist — creating new local branch $BRANCH from current HEAD"
-              git checkout -b "$BRANCH"
-            fi
-          fi
-
-          echo "Prepared local branch: $(git branch --show-current)"
-          git status --porcelain
-          echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
-
-      - name: Commit and push changes to auto branch (with retries)
-        id: push_changes
-        run: |
-          set -euo pipefail
-          BRANCH="${{ steps.prepare_branch.outputs.branch_name }}"
-      
-          # Установим автора/коммитера
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      
-          FILE="Resources/Changelog/ChangelogDS14.yml"
-      
-          # Добавляем изменения
+
           git add "$FILE" || true
-      
+
           # Если нет изменений — выходим
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-      
+
           git commit -m "Обновлён ченжлог #${{ github.event.pull_request.number }}" || true
-      
-          # Попытки пуша (максимум 3 попытки)
-          MAX_TRIES=3
-          PUSHED=false
-      
-          for i in $(seq 1 $MAX_TRIES); do
-            echo "Push attempt $i..."
-            if git push origin "HEAD:$BRANCH"; then
-              echo "Push succeeded"
-              PUSHED=true
-              break
-            fi
-      
-            echo "Push failed, will try to fetch remote and auto-merge changelog, then retry..."
-      
-            # Подтянем remote ветку
-            git fetch origin "$BRANCH" || true
-      
-            # Если remote ветка существует, попробуем аккуратно объединить файл changelog
-            if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH"; then
-              # Получим remote-версию файла (если существует) в /tmp/remote.yml
-              if git ls-tree -r "origin/$BRANCH" --name-only | grep -q "^$FILE$"; then
-                git show "origin/$BRANCH:$FILE" > /tmp/remote.yml || true
-              else
-                echo "{}" > /tmp/remote.yml
-              fi
-      
-              # Получим локальную версию (рабочая копия)
-              if [ -f "$FILE" ]; then
-                cp "$FILE" /tmp/local.yml
-              else
-                echo "{}" > /tmp/local.yml
-              fi
-      
-              # Python-скрипт объединит Entries из remote и локального файлов, удалит дубликаты и пересчитает id
-              python3 - <<'PY'
-              import yaml, hashlib, sys
-              from pathlib import Path
-              remote_path = Path("/tmp/remote.yml")
-              local_path  = Path("/tmp/local.yml")
-              out_path    = Path("Resources/Changelog/ChangelogDS14.yml")
-              
-              def load(p):
-                  try:
-                      return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-                  except Exception:
-                      return {}
-              
-              r = load(remote_path)
-              l = load(local_path)
-              
-              r_entries = r.get("Entries", []) if isinstance(r, dict) else []
-              l_entries = l.get("Entries", []) if isinstance(l, dict) else []
-              
-              def entry_key(e):
-                  # Сформируем ключ по содержимому changes+author+time (строки), чтобы избежать дубликатов
-                  from json import dumps
-                  key = {
-                      "author": e.get("author"),
-                      "time": e.get("time"),
-                      "changes": e.get("changes")
-                  }
-                  return hashlib.sha1(dumps(key, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-              
-              seen = {}
-              merged = []
-              
-              # Сначала remote, затем local (чтобы локальные невошедшие ещё записи оказались после)
-              for ent in (r_entries + l_entries):
-                  k = entry_key(ent)
-                  if k in seen:
-                      continue
-                  seen[k] = True
-                  merged.append(ent)
-              
-              # Пересчитаем id последовательно, начиная с 1, сохраняя порядок (remote затем local)
-              for idx, ent in enumerate(merged, start=1):
-                  ent['id'] = idx
-              
-              out = {"Entries": merged}
-              out_path.parent.mkdir(parents=True, exist_ok=True)
-              out_path.write_text(yaml.dump(out, allow_unicode=True, sort_keys=False, indent=2), encoding="utf-8")
-              print("Merged changelog saved with {} entries".format(len(merged)))
-              PY
-              
-                      # Добавим и закоммитим объединённый файл
-                      git add "$FILE"
-                      if git diff --cached --quiet; then
-                        echo "No staged changes after merge script"
-                      else
-                        git commit -m "Auto-merge changelog from origin/$BRANCH" || true
-                      fi
-              
-                      # Попытаемся запушить снова
-                      if git push origin "HEAD:$BRANCH"; then
-                        echo "Push succeeded after auto-merge"
-                        PUSHED=true
-                        break
-                      else
-                        echo "Push still failed after auto-merge, will retry loop"
-                      fi
-              
-                    else
-                      # remote branch не существует — на следующей итерации push создаст её
-                      echo "Remote branch origin/$BRANCH does not exist — next push will create it"
-                    fi
-              
-                    sleep 1
-                  done
-              
-                  if [ "${PUSHED}" != "true" ]; then
-                    echo "Failed to push after $MAX_TRIES attempts" >&2
-                    # Покажем статус для отладки
-                    git status --porcelain
-                    git log --oneline -n 10 || true
-                    exit 1
-                  fi
 
-      - name: Create PR to master if not exists (or reuse existing)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          REPO="${{ github.repository }}"
-          BRANCH="${{ steps.prepare_branch.outputs.branch_name }}"
-          # ищем открытый PR с head = repo_owner:BRANCH и base = master
-          EXISTING_PR=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/$REPO/pulls?head=${{ github.repository_owner }}:${BRANCH}&base=master" \
-            | jq 'map(select(.state=="open")) | .[0] // empty')
-
-          if [ -z "$EXISTING_PR" ]; then
-            echo "No existing PR found for $BRANCH — creating"
-            curl -s -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/$REPO/pulls" \
-              -d "$(jq -n --arg head "$BRANCH" --arg base "master" --arg title "Auto: обновление changelog" --arg body "Автоматически сгенерированный PR с changelog’ом." '{title:$title, head:$head, base:$base, body:$body}')" \
-              > /tmp/create_pr.json
-            echo "PR создан"
+          echo "Pushing changes to $BRANCH..."
+          if git push origin "HEAD:$BRANCH"; then
+            echo "Push succeeded"
           else
-            PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
-            echo "Found existing PR #$PR_NUMBER — it will be updated with new commits on branch $BRANCH"
+            echo "Push failed: non-fast-forward or protected branch. Exiting with error." >&2
+            # Для отладки — покажем краткую информацию
+            git status --porcelain || true
+            git log --oneline -n 20 || true
+            exit 1
           fi
+
+      - name: (noop) PR-step removed
+        run: echo "Changelog committed directly to base branch (${{ github.event.pull_request.base.ref }})"
